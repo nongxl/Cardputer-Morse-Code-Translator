@@ -1,23 +1,18 @@
 # main.py
 # M5Stack Cardputer 莫斯电码翻译器
-# 最终生产版 - 修复了菜单闪烁、按键逻辑、焦点问题并新增了输入比对功能
+# 最终生产版 - 采用统一的M5.Lcd渲染，修复所有UI冲突和状态问题
 
 import M5
-from M5 import Widgets, Speaker
+from M5 import Speaker
 from hardware.matrix_keyboard import MatrixKeyboard
 import time
 
-
 # --- [1] 状态机和全局变量 ---
 output_string = "Ready."
+last_input_display_string = ""  # 用于存储上一次输入内容的全局变量
 
 # 定义动作列表
 ACTIONS = ["Switch Mode", "Play Demo", "Speaker", "Presets"]
-
-# UI元素
-current_mode_label = None
-input_label = None
-last_input_label = None # 新增：用于显示上一次输入的标签
 
 # 键盘和状态
 kb = None
@@ -72,17 +67,19 @@ class OptionsMenu:
         self.title = title
         self.selected_index = 0
         self.visible = False
-        # 颜色定义
-        self.bg_color = 0x2c2c2c
-        self.border_color = 0xaaaaaa
-        self.text_color = 0xffffff
-        self.selected_bg_color = 0x007acc
+        self.dirty = True  # [闪烁修复] 新增脏标记
+        # 采用您调整后的颜色定义
+        self.bg_color = 0xffffff
+        self.border_color = 0xffffff
+        self.text_color = 0x222222
+        self.selected_bg_color = 0xc2bcbc
         self.selected_text_color = 0xffffff
-        self.title_bg_color = 0x4a4a4a
+        self.title_bg_color = 0xc2bcbc
 
     def show(self):
         self.visible = True
         self.selected_index = 0
+        self.dirty = True  # [闪烁修复] 显示时标记为需要重绘
 
     def hide(self):
         self.visible = False
@@ -92,14 +89,16 @@ class OptionsMenu:
         if not self.visible:
             return None
 
-        # [修正] 您的方向键修复是正确的
+        # 采用您修复后的方向键逻辑
         if key_str == ';':  # 分号键，作为“向上”
             self.selected_index = (self.selected_index - 1 + len(self.items)) % len(self.items)
+            self.dirty = True  # [闪烁修复] 选择变化时标记为需要重绘
         elif key_str == '.':  # 句号键，作为“向下”
             self.selected_index = (self.selected_index + 1) % len(self.items)
+            self.dirty = True  # [闪烁修复] 选择变化时标记为需要重绘
         elif key_str in ('enter', '\r'):
             return self.items[self.selected_index]
-        # [问题1修正] 同时处理 ` 和 \x1b 作为退出键
+        # [最终修正] 同时处理 ` 和 \x1b 作为退出键
         elif key_str in ('`', '\x1b'):
             self.hide()
             return 'close'
@@ -107,7 +106,7 @@ class OptionsMenu:
 
     def draw(self):
         """完全使用 M5.Lcd API 手动绘制，稳定可靠。"""
-        if not self.visible:
+        if not self.visible or not self.dirty:  # [闪烁修复] 仅在需要时重绘
             return
 
         M5.Lcd.fillRect(self.x, self.y, self.w, self.h, self.bg_color)
@@ -135,8 +134,10 @@ class OptionsMenu:
             M5.Lcd.setCursor(self.x + 10, item_y)
             M5.Lcd.print(display_text)
             item_y += 25
-            if item_y > self.y + self.h - 15: # 增加边界检查
+            if item_y > self.y + self.h - 15:  # 增加边界检查
                 break
+
+        self.dirty = False  # [闪烁修复] 重绘后清除标记
 
 
 class PresetList(OptionsMenu):
@@ -146,12 +147,22 @@ class PresetList(OptionsMenu):
 
 # --- [3] 核心函数 ---
 
-def draw_output_text(text_to_draw):
-    """使用底层Lcd API手动绘制带有换行的输出文本"""
-    M5.Lcd.fillRect(8, 35, 280, 45, 0xffffff) # 清除输出区域
+def redraw_ui():
+    """一个统一的重绘函数，用于在关闭菜单或播放后恢复界面"""
+    # [最终修正] 使用 M5.Lcd.fillScreen 并手动重绘所有元素
+    M5.Lcd.fillScreen(0xffffff)
+
+    # --- 绘制所有主UI元素 ---
     M5.Lcd.setTextSize(2)
-    M5.Lcd.setTextColor(0x000000)
-    words = text_to_draw.split(' ')
+
+    # 绘制上一次的输入
+    M5.Lcd.setTextColor(0x888888, 0xffffff)
+    M5.Lcd.setCursor(8, 20)
+    M5.Lcd.print(last_input_display_string)
+
+    # 绘制输出结果
+    M5.Lcd.setTextColor(0x000000, 0xffffff)
+    words = output_string.split(' ')
     lines = []
     current_line = ""
     for word in words:
@@ -162,54 +173,47 @@ def draw_output_text(text_to_draw):
             lines.append(current_line)
             current_line = word
     lines.append(current_line)
-    draw_y = 35
+    draw_y = 40
     for line in lines:
         M5.Lcd.setCursor(8, draw_y)
         M5.Lcd.print(line)
         draw_y += 18
         if draw_y > 75: break
 
+    # 绘制当前模式
+    M5.Lcd.setTextColor(0x000000, 0xffffff)
+    M5.Lcd.setCursor(8, 80)
+    M5.Lcd.print(MODES[current_mode_index])
+
+    # 绘制当前输入行
+    M5.Lcd.setTextColor(0x000000, 0xffffff)
+    M5.Lcd.setCursor(8, 96)
+    M5.Lcd.print(">" + input_string)
+
 
 def setup():
-    global current_mode_label, input_label, last_input_label, kb, options_menu, preset_list
+    global kb, options_menu, preset_list
     M5.begin()
-    Widgets.fillScreen(0xffffff)
 
-    # --- 初始化UI ---
-    # 左侧核心显示区
-    last_input_label = Widgets.Label("", 8, 20, 1.0, 0x888888, 0xffffff, Widgets.FONTS.DejaVu18)
-    current_mode_label = Widgets.Label(MODES[0], 8, 80, 1.0, 0x000000, 0xffffff, Widgets.FONTS.DejaVu18)
-    input_label = Widgets.Label(">", 8, 96, 1.0, 0x000000, 0xffffff, Widgets.FONTS.DejaVu18)
-    draw_output_text(output_string)
-
-    # 初始化模态菜单，并传入对应的项目列表
-    options_menu = OptionsMenu(80, 10, 160, 115, ACTIONS, title="Options")
-    preset_list = PresetList(80, 10, 160, 115, PRESET_KEYS, title="Presets")
+    # 初始化模态菜单
+    options_menu = OptionsMenu(60, 10, 160, 115, ACTIONS, title="Options")
+    preset_list = PresetList(40, 10, 160, 115, PRESET_KEYS, title="Presets")
 
     # 初始化键盘
     kb = MatrixKeyboard()
 
-
-def redraw_ui():
-    """一个统一的重绘函数，用于在关闭菜单或播放后恢复界面"""
-    M5.Lcd.fillRect(0, 0, 320, 135, 0xffffff)  # 清空整个屏幕
-    # [问题2修正] 更新 Widgets 以强制重绘，而不是调用.draw()
-    last_input_label.setText(last_input_label.getText())
-    current_mode_label.setText(current_mode_label.getText())
-    input_label.setText(input_label.getText())
-    # 手动绘制非 Widget 部分
-    draw_output_text(output_string)
+    # 首次绘制UI
+    redraw_ui()
 
 
 def translate():
     """翻译核心函数"""
-    global input_string, last_morse_output, output_string
+    global input_string, last_morse_output, output_string, last_input_display_string
 
-    # [新功能] 在翻译前，保存并显示本次的输入
     if input_string:
-        last_input_label.setText(f"In: {input_string[:25]}")  # 限制长度防止溢出
+        last_input_display_string = f"In: {input_string[:25]}"
     else:
-        last_input_label.setText("")  # 如果没有输入，则清空
+        last_input_display_string = ""
 
     mode = MODES[current_mode_index]
     translated_text = ""
@@ -229,34 +233,35 @@ def translate():
 
     last_morse_output = translated_text.replace('/', ' ')
     output_string = translated_text
-    draw_output_text(output_string)
-
     input_string = ""
-    input_label.setText(">")
+
+    redraw_ui()
 
 
 def play_morse():
     """播放莫斯电码声音，并同步屏幕闪烁"""
     global last_morse_output
     if not last_morse_output: return
-    print("Playing morse with sound and light:", last_morse_output)
+
+    # 播放前先隐藏主UI，避免视觉混乱
+    M5.Lcd.fillScreen(0x000000)
+
     for symbol in last_morse_output:
         duration = 0
         if symbol == '.':
             duration = 80
         elif symbol == '-':
             duration = 240
+
         if duration > 0:
             if speaker_on: Speaker.tone(800, duration)
-            M5.Lcd.fillScreen(0x000000)
             time.sleep_ms(duration)
-            M5.Lcd.fillScreen(0xffffff)
-            time.sleep_ms(80)
+            if speaker_on: Speaker.noTone()
+            time.sleep_ms(80)  # 音调间的间隔
         elif symbol == ' ':
-            time.sleep_ms(160)
-    if speaker_on: Speaker.noTone()
-    redraw_ui()  # 播放结束后重绘整个UI
+            time.sleep_ms(160)  # 字符间的间隔
 
+    redraw_ui()  # 播放结束后重绘整个UI
 
 def handle_input():
     """处理所有键盘输入和功能逻辑"""
@@ -273,9 +278,7 @@ def handle_input():
     if is_key_down and not last_key_state:
         key_string = kb.get_string()
         if key_string:
-            print(f"Key detected: {repr(key_string)}")
-
-            # [核心架构变更] 模态输入处理
+            # 模态输入处理
             if is_menu_active:
                 action = options_menu.handle_key(key_string)
                 if action == 'close':
@@ -283,16 +286,14 @@ def handle_input():
                     redraw_ui()
                 elif action == "Switch Mode":
                     current_mode_index = (current_mode_index + 1) % len(MODES)
-                    current_mode_label.setText(MODES[current_mode_index])
                     is_menu_active = False
                     redraw_ui()
                 elif action == "Play Demo":
                     is_menu_active = False
-                    redraw_ui()
-                    play_morse()
+                    play_morse() # 直接播放，播放完会自动重绘
                 elif action == "Speaker":
                     speaker_on = not speaker_on
-                    # 菜单会在下一帧自动重绘并显示新状态
+                    options_menu.dirty = True  # [闪烁修复] 状态改变，标记菜单需要重绘
                 elif action == "Presets":
                     is_menu_active = False
                     is_selecting_preset = True
@@ -305,9 +306,8 @@ def handle_input():
                     redraw_ui()
                 elif preset:
                     input_string = preset
-                    input_label.setText(">" + input_string)
                     is_selecting_preset = False
-                    redraw_ui()
+                    redraw_ui() # 选择预设后重绘主界面
 
             else:
                 # --- 正常模式下的输入处理 ---
@@ -315,14 +315,13 @@ def handle_input():
                     is_menu_active = True
                     options_menu.show()
                 elif key_string in ('enter', '\r'):
-                    # 修复了焦点问题：现在Enter只负责提交翻译
                     translate()
                 elif key_string == '\x08':  # 删除键
                     input_string = input_string[:-1]
-                    input_label.setText(">" + input_string)
+                    redraw_ui() # 删除字符后也需要重绘输入行
                 else:  # 其他所有可打印字符
                     input_string += key_string
-                    input_label.setText(">" + input_string)
+                    redraw_ui() # 输入字符后也需要重绘输入行
 
     last_key_state = is_key_down
 
@@ -331,7 +330,7 @@ def loop():
     M5.update()
     handle_input()
 
-    # [核心架构变更] 在主循环中绘制模态UI
+    # [闪烁修复] 仅在需要时绘制模态UI
     if is_menu_active:
         options_menu.draw()
     elif is_selecting_preset:
@@ -346,7 +345,6 @@ if __name__ == '__main__':
     except (Exception, KeyboardInterrupt) as e:
         try:
             from utility import print_error_msg
-
             print_error_msg(e)
         except ImportError:
             print("please update to latest firmware")
