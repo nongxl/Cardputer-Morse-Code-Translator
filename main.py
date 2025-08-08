@@ -1,37 +1,52 @@
 # main.py
 # M5Stack Cardputer 莫斯电码翻译器
-# 最终生产版 - 采用统一的M5.Lcd渲染，修复所有UI冲突和状态问题
+# 最终生产版 - 为兼容旧固件，菜单使用默认字体
 
 import M5
-from M5 import Speaker
+from M5 import Widgets, Speaker
 from hardware.matrix_keyboard import MatrixKeyboard
 import time
+import sys
 
 # --- [1] 状态机和全局变量 ---
+# 主界面显示内容
 output_string = "Ready."
-last_input_display_string = ""  # 用于存储上一次输入内容的全局变量
+last_input_display_string = ""
+input_string = ""
 
-# 定义动作列表
+# --- 新增：主界面输出滚动状态 ---
+output_lines = []
+output_scroll_top_line = 0
+
+# 菜单定义
 ACTIONS = ["Switch Mode", "Play Demo", "Speaker", "Presets"]
 
-# 键盘和状态
-kb = None
-last_key_state = False
-
-# 应用状态
-MODES = ["Text -> Morse", "Morse -> Text"]
-current_mode_index = 0
-input_string = ""
-last_morse_output = ""
-speaker_on = False
-
-# 模态UI的状态
-is_menu_active = False
+# --- UI元素 ---
+# 主界面 (Widgets)
+# [优化] 使用两个独立的Label实现可靠的换行输出
+output_label_1 = None
+output_label_2 = None
+last_input_label = None
+current_mode_label = None
+input_label = None
+tab_hint_label = None
+# 菜单 (Lcd)
 options_menu = None
-is_selecting_preset = False
 preset_list = None
 
-# 预设
+# --- 系统状态 ---
+kb = None
+last_key_state = False
+MODES = ["Text -> Morse", "Morse -> Text"]
+current_mode_index = 0
+last_morse_output = ""  # This will now contain '/' for word gaps
+speaker_on = False
+
+# --- 模态状态 ---
+is_menu_active = False
+is_selecting_preset = False
+
+# --- 数据常量 ---
 PRESETS = {
     "SOS": "... --- ...",
     "CQ": "-.-. --.-",
@@ -39,10 +54,12 @@ PRESETS = {
     "HELLO": ".... . .-.. .-.. ---",
     "QTH?": "--.- - .... ..--..",
     "MY NAME IS": "-- -.-- / -. .- -- . / .. ...",
+    "TEST": "- . ... -",
+    "DE": "-.. .",
+    "K": "-.-"
 }
 PRESET_KEYS = list(PRESETS.keys())
 
-# 莫斯电码字典 (保持不变)
 CHAR_TO_MORSE = {
     'A': '.-', 'B': '-...', 'C': '-.-.', 'D': '-..', 'E': '.', 'F': '..-.', 'G': '--.', 'H': '....',
     'I': '..', 'J': '.---', 'K': '-.-', 'L': '.-..', 'M': '--', 'N': '-.', 'O': '---', 'P': '.--.',
@@ -56,10 +73,10 @@ CHAR_TO_MORSE = {
 MORSE_TO_CHAR = {v: k for k, v in CHAR_TO_MORSE.items()}
 
 
-# --- [2] UI类定义 ---
+# --- [2] UI类定义 (底层Lcd绘制) ---
 
-class OptionsMenu:
-    """一个功能齐全的、可复用的模态选项菜单。"""
+class LcdOptionsMenu:
+    """一个“哑”的、支持滚动的模态选项菜单。"""
 
     def __init__(self, x, y, w, h, items, title=""):
         self.x, self.y, self.w, self.h = x, y, w, h
@@ -67,153 +84,227 @@ class OptionsMenu:
         self.title = title
         self.selected_index = 0
         self.visible = False
-        self.dirty = True  # [闪烁修复] 新增脏标记
-        # 采用您调整后的颜色定义
-        self.bg_color = 0xffffff
-        self.border_color = 0xffffff
+        self.dirty = True
+
+        # --- 滚动状态 ---
+        self.top_item_index = 0
+
+        # [最终方案] 恢复2倍字体，但使用更紧凑的布局
+        self.item_row_height = 22  # 优化行高
+        self.title_area_height = 28  # 优化标题区域高度
+        self.max_visible_items = (self.h - self.title_area_height) // self.item_row_height
+
+        # 颜色和字体定义
         self.text_color = 0x222222
-        self.selected_bg_color = 0xc2bcbc
+        self.bg_color = 0xe9e8e8
         self.selected_text_color = 0xffffff
-        self.title_bg_color = 0xc2bcbc
+        self.selected_bg_color = 0x007acc
+        self.title_bg_color = 0xcccccc
+        self.scroll_indicator_color = 0x888888
 
     def show(self):
         self.visible = True
         self.selected_index = 0
-        self.dirty = True  # [闪烁修复] 显示时标记为需要重绘
+        self.top_item_index = 0
+        self.dirty = True
 
     def hide(self):
         self.visible = False
 
     def handle_key(self, key_str):
-        """处理按键输入，返回选择结果或'close'。"""
         if not self.visible:
             return None
 
-        # 采用您修复后的方向键逻辑
-        if key_str == ';':  # 分号键，作为“向上”
+        if key_str == ';':  # Up
             self.selected_index = (self.selected_index - 1 + len(self.items)) % len(self.items)
-            self.dirty = True  # [闪烁修复] 选择变化时标记为需要重绘
-        elif key_str == '.':  # 句号键，作为“向下”
+            if self.selected_index < self.top_item_index:
+                self.top_item_index = self.selected_index
+            elif self.selected_index == len(self.items) - 1:
+                self.top_item_index = max(0, len(self.items) - self.max_visible_items)
+            self.dirty = True
+        elif key_str == '.':  # Down
             self.selected_index = (self.selected_index + 1) % len(self.items)
-            self.dirty = True  # [闪烁修复] 选择变化时标记为需要重绘
+            if self.selected_index >= self.top_item_index + self.max_visible_items:
+                self.top_item_index = self.selected_index - self.max_visible_items + 1
+            elif self.selected_index == 0:
+                self.top_item_index = 0
+            self.dirty = True
         elif key_str in ('enter', '\r'):
             return self.items[self.selected_index]
-        # [最终修正] 同时处理 ` 和 \x1b 作为退出键
         elif key_str in ('`', '\x1b'):
-            self.hide()
             return 'close'
         return None
 
     def draw(self):
-        """完全使用 M5.Lcd API 手动绘制，稳定可靠。"""
-        if not self.visible or not self.dirty:  # [闪烁修复] 仅在需要时重绘
+        if not self.visible or not self.dirty:
             return
 
-        M5.Lcd.fillRect(self.x, self.y, self.w, self.h, self.bg_color)
-        M5.Lcd.drawRect(self.x, self.y, self.w, self.h, self.border_color)
-        M5.Lcd.fillRect(self.x + 1, self.y + 1, self.w - 2, 22, self.title_bg_color)
+        # [最终方案] 使用2倍大小的默认字体
         M5.Lcd.setTextSize(2)
+        M5.Lcd.fillRect(self.x, self.y, self.w, self.h, self.bg_color)
+        M5.Lcd.fillRect(self.x, self.y, self.w, 24, self.title_bg_color)
         M5.Lcd.setTextColor(self.text_color, self.title_bg_color)
-        M5.Lcd.setCursor(self.x + 5, self.y + 5)
+        M5.Lcd.setCursor(self.x + 8, self.y + 5)
         M5.Lcd.print(self.title)
 
-        item_y = self.y + 30
-        for i, item_text in enumerate(self.items):
-            # 动态生成扬声器状态文本
-            if item_text == "Speaker":
-                display_text = f"Speaker: {'ON' if speaker_on else 'OFF'}"
-            else:
-                display_text = item_text
+        # 绘制视口内的项目
+        for i in range(self.max_visible_items):
+            item_global_index = self.top_item_index + i
+            if item_global_index >= len(self.items):
+                break
 
-            if i == self.selected_index:
+            item_y = self.y + self.title_area_height + (i * self.item_row_height)
+            item_text_base = self.items[item_global_index]
+            text = f"Speaker: {'ON' if speaker_on else 'OFF'}" if item_text_base == "Speaker" else item_text_base
+
+            if item_global_index == self.selected_index:
                 M5.Lcd.fillRect(self.x + 2, item_y - 2, self.w - 4, 20, self.selected_bg_color)
                 M5.Lcd.setTextColor(self.selected_text_color, self.selected_bg_color)
             else:
                 M5.Lcd.setTextColor(self.text_color, self.bg_color)
 
             M5.Lcd.setCursor(self.x + 10, item_y)
-            M5.Lcd.print(display_text)
-            item_y += 25
-            if item_y > self.y + self.h - 15:  # 增加边界检查
-                break
+            M5.Lcd.print(text)
 
-        self.dirty = False  # [闪烁修复] 重绘后清除标记
+        # 绘制滚动指示器
+        if len(self.items) > self.max_visible_items:
+            if self.top_item_index > 0:
+                M5.Lcd.fillTriangle(self.x + self.w - 18, self.y + 8, self.x + self.w - 23, self.y + 16,
+                                    self.x + self.w - 13, self.y + 16, self.scroll_indicator_color)
+            if self.top_item_index + self.max_visible_items < len(self.items):
+                M5.Lcd.fillTriangle(self.x + self.w - 18, self.y + self.h - 8, self.x + self.w - 23,
+                                    self.y + self.h - 16, self.x + self.w - 13, self.y + self.h - 16,
+                                    self.scroll_indicator_color)
 
-
-class PresetList(OptionsMenu):
-    """专门用于预设选择的列表，干净地继承自OptionsMenu。"""
-    pass
+        self.dirty = False
 
 
 # --- [3] 核心函数 ---
 
-def redraw_ui():
-    """一个统一的重绘函数，用于在关闭菜单或播放后恢复界面"""
-    # [最终修正] 使用 M5.Lcd.fillScreen 并手动重绘所有元素
-    M5.Lcd.fillScreen(0xffffff)
-
-    # --- 绘制所有主UI元素 ---
-    M5.Lcd.setTextSize(2)
-
-    # 绘制上一次的输入
-    M5.Lcd.setTextColor(0x888888, 0xffffff)
-    M5.Lcd.setCursor(8, 20)
-    M5.Lcd.print(last_input_display_string)
-
-    # 绘制输出结果
-    M5.Lcd.setTextColor(0x000000, 0xffffff)
-    words = output_string.split(' ')
+def wrap_text_by_char(text, max_chars):
+    """基于字符数的文本换行"""
     lines = []
+    words = text.split(' ')
     current_line = ""
     for word in words:
-        test_line = (current_line + " " + word).strip()
-        if M5.Lcd.textWidth(test_line) <= 280:
-            current_line = test_line
-        else:
+        if len(current_line) + len(word) + 1 > max_chars:
             lines.append(current_line)
             current_line = word
-    lines.append(current_line)
-    draw_y = 40
-    for line in lines:
-        M5.Lcd.setCursor(8, draw_y)
-        M5.Lcd.print(line)
-        draw_y += 18
-        if draw_y > 75: break
+        else:
+            if current_line:
+                current_line += " " + word
+            else:
+                current_line = word
+    if current_line:
+        lines.append(current_line)
+    return lines if lines else [""]
 
-    # 绘制当前模式
-    M5.Lcd.setTextColor(0x000000, 0xffffff)
-    M5.Lcd.setCursor(8, 80)
-    M5.Lcd.print(MODES[current_mode_index])
 
-    # 绘制当前输入行
-    M5.Lcd.setTextColor(0x000000, 0xffffff)
-    M5.Lcd.setCursor(8, 96)
-    M5.Lcd.print(">" + input_string)
+def draw_scroll_arrows(show_up, show_down):
+    """手动绘制和擦除滚动箭头"""
+    arrow_area_x = 225
+    arrow_area_y = 22
+    arrow_area_w = 15
+    arrow_area_h = 45
+    arrow_color = 0xcccccc
+
+    M5.Lcd.fillRect(arrow_area_x, arrow_area_y, arrow_area_w, arrow_area_h, 0xffffff)
+
+    if show_up:
+        M5.Lcd.fillTriangle(230, 25, 225, 32, 235, 32, arrow_color)
+
+    if show_down:
+        M5.Lcd.fillTriangle(230, 60, 225, 53, 235, 53, arrow_color)
+
+
+def update_output_display():
+    """根据滚动状态更新输出区域的显示"""
+    global output_lines, output_scroll_top_line, output_label_1, output_label_2
+
+    # [优化] 从 output_lines 数组中获取要显示的两行文本
+    line1_text = output_lines[output_scroll_top_line] if output_scroll_top_line < len(output_lines) else ""
+    line2_index = output_scroll_top_line + 1
+    line2_text = output_lines[line2_index] if line2_index < len(output_lines) else ""
+
+    # [优化] 将文本分别设置到两个独立的Label上
+    output_label_1.setText(line1_text)
+    output_label_2.setText(line2_text)
+
+    # 更新滚动箭头的可见性
+    can_scroll_up = output_scroll_top_line > 0
+    # [优化] 滚动逻辑现在基于总行数
+    can_scroll_down = output_scroll_top_line + 2 < len(output_lines)
+    draw_scroll_arrows(can_scroll_up, can_scroll_down)
+
+
+def force_all_widgets_redraw():
+    """通过“清空-赋值”技巧强制所有Widgets重绘"""
+    # [优化] 清空并更新两个输出Label
+    output_label_1.setText("")
+    output_label_2.setText("")
+    update_output_display()
+
+    last_input_label.setText("")
+    last_input_label.setText(last_input_display_string)
+
+    current_mode_label.setText("")
+    current_mode_label.setText(MODES[current_mode_index])
+
+    input_label.setText("")
+    input_label.setText(">" + input_string)
+
+    # [修正] 增加对tab_hint_label的重绘，解决其消失的问题
+    tab_hint_label.setText("")
+    tab_hint_label.setText("menu: tab")
+
+
+def restore_ui_after_menu_close(menu_to_clear):
+    """精确擦除菜单区域并恢复UI"""
+    M5.Lcd.fillRect(menu_to_clear.x, menu_to_clear.y, menu_to_clear.w, menu_to_clear.h, 0xffffff)
+    force_all_widgets_redraw()
 
 
 def setup():
     global kb, options_menu, preset_list
+    global output_label_1, output_label_2, last_input_label, current_mode_label, input_label, tab_hint_label
+    global output_lines
     M5.begin()
+    Widgets.fillScreen(0xffffff)
 
-    # 初始化模态菜单
-    options_menu = OptionsMenu(60, 10, 160, 115, ACTIONS, title="Options")
-    preset_list = PresetList(40, 10, 160, 115, PRESET_KEYS, title="Presets")
+    # --- 主UI控件 ---
+    last_input_label = Widgets.Label("", 8, 4, 1.0, 0x888888, 0xffffff, Widgets.FONTS.DejaVu12)
+    tab_hint_label = Widgets.Label("menu: tab", 160, 4, 1.0, 0x888888, 0xffffff, Widgets.FONTS.DejaVu12)
 
-    # 初始化键盘
+    # [优化] 创建两个独立的Label用于输出，确保换行可靠
+    output_label_1 = Widgets.Label("", 8, 22, 1.0, 0x000000, 0xffffff, Widgets.FONTS.DejaVu18)
+    output_label_2 = Widgets.Label("", 8, 42, 1.0, 0x000000, 0xffffff, Widgets.FONTS.DejaVu18)
+
+    current_mode_label = Widgets.Label(MODES[0], 8, 70, 1.0, 0x000000, 0xffffff, Widgets.FONTS.DejaVu18)
+    input_label = Widgets.Label(">", 8, 98, 1.0, 0x000000, 0xffffff, Widgets.FONTS.DejaVu18)
+
+    # --- 菜单 ---
+    menu_height = 122
+    options_menu = LcdOptionsMenu(35, 8, 200, menu_height, ACTIONS, title="Options")
+    preset_list = LcdOptionsMenu(35, 8, 200, menu_height, PRESET_KEYS, title="Presets")
+
     kb = MatrixKeyboard()
 
-    # 首次绘制UI
-    redraw_ui()
+    # 初始化显示
+    output_lines = wrap_text_by_char(output_string, 25)
+    update_output_display()
 
 
 def translate():
     """翻译核心函数"""
     global input_string, last_morse_output, output_string, last_input_display_string
+    global output_lines, output_scroll_top_line
 
     if input_string:
-        last_input_display_string = f"In: {input_string[:25]}"
+        # [优化] 缩短历史输入预览的长度，防止覆盖右上角提示
+        last_input_display_string = f"In: {input_string[:18]}"
     else:
         last_input_display_string = ""
+    last_input_label.setText(last_input_display_string)
 
     mode = MODES[current_mode_index]
     translated_text = ""
@@ -221,6 +312,7 @@ def translate():
         text_to_translate = input_string.upper()
         morse_result = [CHAR_TO_MORSE.get(c, '?' if c != ' ' else '/') for c in text_to_translate]
         translated_text = " ".join(morse_result)
+        last_morse_output = translated_text  # Store for playing
     elif mode == "Morse -> Text":
         morse_words = input_string.split('/')
         text_result = []
@@ -230,43 +322,67 @@ def translate():
                 if code: text_result.append(MORSE_TO_CHAR.get(code, '?'))
             text_result.append(' ')
         translated_text = "".join(text_result).strip()
+        last_morse_output = ""  # Can't play text
 
-    last_morse_output = translated_text.replace('/', ' ')
-    output_string = translated_text
+    output_lines = wrap_text_by_char(translated_text, 25)
+    output_scroll_top_line = 0
+    update_output_display()
+
     input_string = ""
-
-    redraw_ui()
+    input_label.setText(">")
 
 
 def play_morse():
-    """播放莫斯电码声音，并同步屏幕闪烁"""
+    """播放莫斯电码声音，并提供视觉反馈"""
     global last_morse_output
     if not last_morse_output: return
 
-    # 播放前先隐藏主UI，避免视觉混乱
+    # [优化] 增加视觉反馈
     M5.Lcd.fillScreen(0x000000)
+    M5.Lcd.setTextColor(0xffffff)
+    M5.Lcd.setTextSize(1)
+    M5.Lcd.setCursor(10, 10)
+    M5.Lcd.print("Playing:")
+    M5.Lcd.setCursor(10, 30)
+    # 自动换行显示要播放的摩斯电码
+    demo_lines = wrap_text_by_char(last_morse_output, 38)
+    for line in demo_lines:
+        M5.Lcd.println(line)
 
+    # [优化] 修复播放逻辑，正确处理单词间隔
     for symbol in last_morse_output:
         duration = 0
+        pause = 0
         if symbol == '.':
             duration = 80
+            pause = 80  # Inter-element gap
         elif symbol == '-':
             duration = 240
-
-        if duration > 0:
-            if speaker_on: Speaker.tone(800, duration)
-            time.sleep_ms(duration)
-            if speaker_on: Speaker.noTone()
-            time.sleep_ms(80)  # 音调间的间隔
+            pause = 80  # Inter-element gap
         elif symbol == ' ':
-            time.sleep_ms(160)  # 字符间的间隔
+            pause = 240  # Inter-letter gap (3 units - 1 already paused)
+        elif symbol == '/':
+            pause = 480  # Word gap (7 units - 1 already paused)
 
-    redraw_ui()  # 播放结束后重绘整个UI
+        if duration > 0 and speaker_on:
+            Speaker.tone(800, duration)
+
+        time.sleep_ms(duration)
+
+        if duration > 0 and speaker_on:
+            Speaker.noTone()
+
+        time.sleep_ms(pause)
+
+    # 播放结束后恢复UI
+    Widgets.fillScreen(0xffffff)
+    force_all_widgets_redraw()
+
 
 def handle_input():
     """处理所有键盘输入和功能逻辑"""
-    global last_key_state, input_string, current_mode_index, speaker_on, output_string
-    global is_menu_active, is_selecting_preset
+    global last_key_state, input_string, current_mode_index, speaker_on
+    global is_menu_active, is_selecting_preset, output_scroll_top_line
 
     is_key_down = False
     try:
@@ -278,50 +394,62 @@ def handle_input():
     if is_key_down and not last_key_state:
         key_string = kb.get_string()
         if key_string:
-            # 模态输入处理
             if is_menu_active:
                 action = options_menu.handle_key(key_string)
-                if action == 'close':
+                if action:
                     is_menu_active = False
-                    redraw_ui()
-                elif action == "Switch Mode":
-                    current_mode_index = (current_mode_index + 1) % len(MODES)
-                    is_menu_active = False
-                    redraw_ui()
-                elif action == "Play Demo":
-                    is_menu_active = False
-                    play_morse() # 直接播放，播放完会自动重绘
-                elif action == "Speaker":
-                    speaker_on = not speaker_on
-                    options_menu.dirty = True  # [闪烁修复] 状态改变，标记菜单需要重绘
-                elif action == "Presets":
-                    is_menu_active = False
-                    is_selecting_preset = True
-                    preset_list.show()
+                    options_menu.hide()
+                    restore_ui_after_menu_close(options_menu)
+
+                    if action != 'close':
+                        if action == "Switch Mode":
+                            current_mode_index = (current_mode_index + 1) % len(MODES)
+                            current_mode_label.setText(MODES[current_mode_index])
+                        elif action == "Play Demo":
+                            play_morse()
+                        elif action == "Speaker":
+                            speaker_on = not speaker_on
+                        elif action == "Presets":
+                            is_selecting_preset = True
+                            preset_list.show()
 
             elif is_selecting_preset:
                 preset = preset_list.handle_key(key_string)
-                if preset == 'close':
+                if preset:
                     is_selecting_preset = False
-                    redraw_ui()
-                elif preset:
-                    input_string = preset
-                    is_selecting_preset = False
-                    redraw_ui() # 选择预设后重绘主界面
+                    preset_list.hide()
+                    restore_ui_after_menu_close(preset_list)
+
+                    if preset != 'close':
+                        input_string = PRESETS.get(preset, "")
+                        # This will be handled by the general input update below
 
             else:
-                # --- 正常模式下的输入处理 ---
-                if key_string == '\t':
+                if key_string == '[':  # Scroll Up
+                    if output_scroll_top_line > 0:
+                        output_scroll_top_line -= 1
+                        update_output_display()
+                elif key_string == ']':  # Scroll Down
+                    if output_scroll_top_line + 2 < len(output_lines):
+                        output_scroll_top_line += 1
+                        update_output_display()
+                elif key_string == '\t':
                     is_menu_active = True
                     options_menu.show()
                 elif key_string in ('enter', '\r'):
                     translate()
-                elif key_string == '\x08':  # 删除键
+                elif key_string == '\x08':  # Backspace
                     input_string = input_string[:-1]
-                    redraw_ui() # 删除字符后也需要重绘输入行
-                else:  # 其他所有可打印字符
+                else:
                     input_string += key_string
-                    redraw_ui() # 输入字符后也需要重绘输入行
+
+            # [优化] 统一处理输入行显示，实现滚动效果
+            if not is_menu_active and not is_selecting_preset:
+                max_input_chars = 25  # 安全的单行字符数
+                display_input = ">" + input_string
+                if len(display_input) > max_input_chars:
+                    display_input = ">" + input_string[-(max_input_chars - 1):]
+                input_label.setText(display_input)
 
     last_key_state = is_key_down
 
@@ -330,7 +458,6 @@ def loop():
     M5.update()
     handle_input()
 
-    # [闪烁修复] 仅在需要时绘制模态UI
     if is_menu_active:
         options_menu.draw()
     elif is_selecting_preset:
@@ -343,8 +470,5 @@ if __name__ == '__main__':
         while True:
             loop()
     except (Exception, KeyboardInterrupt) as e:
-        try:
-            from utility import print_error_msg
-            print_error_msg(e)
-        except ImportError:
-            print("please update to latest firmware")
+        print("--- A FATAL ERROR OCCURRED ---")
+        sys.print_exception(e)
