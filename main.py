@@ -19,7 +19,7 @@ output_lines = []
 output_scroll_top_line = 0
 
 # 菜单定义
-ACTIONS = ["Switch Mode", "Play Demo", "Speaker", "Presets"]
+ACTIONS = ["Play Demo", "Speaker", "Presets", "Switch Mode"]
 
 # --- UI元素 ---
 # 主界面 (Widgets)
@@ -309,9 +309,15 @@ def translate():
     mode = MODES[current_mode_index]
     translated_text = ""
     if mode == "Text -> Morse":
-        text_to_translate = input_string.upper()
-        morse_result = [CHAR_TO_MORSE.get(c, '?' if c != ' ' else '/') for c in text_to_translate]
-        translated_text = " ".join(morse_result)
+        # [修正] 采用更健壮的逻辑生成莫斯码字符串，确保单词和字母间隔正确
+        # 这可以防止在单词之间产生多余的空格，从而修复时序计算错误
+        words = input_string.upper().split(' ')
+        morse_words = []
+        for word in words:
+            if not word: continue
+            letters = [CHAR_TO_MORSE.get(c, '?') for c in word]
+            morse_words.append(" ".join(letters))
+        translated_text = " / ".join(morse_words)
         last_morse_output = translated_text  # Store for playing
     elif mode == "Morse -> Text":
         morse_words = input_string.split('/')
@@ -337,44 +343,52 @@ def play_morse():
     global last_morse_output
     if not last_morse_output: return
 
-    # [优化] 增加视觉反馈
-    M5.Lcd.fillScreen(0x000000)
-    M5.Lcd.setTextColor(0xffffff)
-    M5.Lcd.setTextSize(1)
+    # --- [最终方案] 使用背光控制实现真正的瞬时闪烁 ---
+    # 1. 准备屏幕内容 (一次性绘制)
+    M5.Lcd.fillRect(0, 0, 240, 135, 0xffffff)  # 白色背景
+    M5.Lcd.setTextColor(0x000000) # 黑色文字
+    M5.Lcd.setTextSize(2)
     M5.Lcd.setCursor(10, 10)
     M5.Lcd.print("Playing:")
     M5.Lcd.setCursor(10, 30)
-    # 自动换行显示要播放的摩斯电码
     demo_lines = wrap_text_by_char(last_morse_output, 38)
     for line in demo_lines:
-        M5.Lcd.println(line)
+        M5.Lcd.print(line)
 
-    # [优化] 修复播放逻辑，正确处理单词间隔
+    # 2. 循环播放，只控制背光和声音
     for symbol in last_morse_output:
         duration = 0
         pause = 0
+        # [优化] 基于 10 WPM (每点120ms) 重新设定时序，并修复间隔逻辑
+        # 1 WPM = 1200 / dot_length_ms
+        dot_length = 120
+
         if symbol == '.':
-            duration = 80
-            pause = 80  # Inter-element gap
+            duration = dot_length
+            pause = dot_length  # 元素内间隔: 1个点
         elif symbol == '-':
-            duration = 240
-            pause = 80  # Inter-element gap
+            duration = dot_length * 3
+            pause = dot_length  # 元素内间隔: 1个点
         elif symbol == ' ':
-            pause = 240  # Inter-letter gap (3 units - 1 already paused)
+            # 字母间额外停顿: 2个点 (总停顿 = 1 + 2 = 3个点)
+            pause = dot_length * 2
         elif symbol == '/':
-            pause = 480  # Word gap (7 units - 1 already paused)
+            # 单词间额外停顿: 4个点 (总停顿 = 3(字母间隔) + 4 = 7个点)
+            pause = dot_length * 4
 
-        if duration > 0 and speaker_on:
-            Speaker.tone(800, duration)
+        if duration > 0:
+            M5.Lcd.setBrightness(200)  # 背光开启 (使用一个柔和的亮度)
+            if speaker_on:
+                Speaker.tone(800, duration)
 
-        time.sleep_ms(duration)
+            time.sleep_ms(duration)
 
-        if duration > 0 and speaker_on:
-            Speaker.noTone()
+            M5.Lcd.setBrightness(0)    # 背光关闭
 
         time.sleep_ms(pause)
 
-    # 播放结束后恢复UI
+    # 3. 恢复UI和正常亮度
+    M5.Lcd.setBrightness(100)  # 恢复到正常的亮度
     Widgets.fillScreen(0xffffff)
     force_all_widgets_redraw()
 
@@ -421,7 +435,11 @@ def handle_input():
                     restore_ui_after_menu_close(preset_list)
 
                     if preset != 'close':
-                        input_string = PRESETS.get(preset, "")
+                        # 根据当前模式决定将预设的文本还是莫斯码放入输入区
+                        if MODES[current_mode_index] == "Text -> Morse":
+                            input_string = preset  # 放入预设的文本 (key)
+                        else: # Morse -> Text 模式
+                            input_string = PRESETS.get(preset, "") # 放入预设的莫斯码 (value)
                         # This will be handled by the general input update below
 
             else:
